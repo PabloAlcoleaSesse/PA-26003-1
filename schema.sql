@@ -3,19 +3,21 @@
 -- ============================================================================
 
 -- Table: companies
--- Stores registered equities discovered from the SEC EDGAR system
+-- Stores registered equities discovered from benchmark indices or SEC EDGAR
 CREATE TABLE IF NOT EXISTS companies (
     ticker VARCHAR(10) PRIMARY KEY,
     name TEXT NOT NULL,
     cik VARCHAR(10) NOT NULL,
     sector TEXT,
     industry TEXT,
+    exchange TEXT,
+    universe VARCHAR(50) NOT NULL DEFAULT 'SEC',
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Table: fundamentals
--- Stores point-in-time and trailing fundamental/valuation metrics
+-- Stores point-in-time and trailing fundamental, quality, valuation, and momentum metrics
 CREATE TABLE IF NOT EXISTS fundamentals (
     id BIGSERIAL PRIMARY KEY,
     ticker VARCHAR(10) NOT NULL REFERENCES companies(ticker) ON DELETE CASCADE,
@@ -23,33 +25,57 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     filing_date DATE,
     market_cap BIGINT,
     pe_forward NUMERIC,
+    trailing_pe NUMERIC,
+    peg_ratio NUMERIC,
+    price_to_book NUMERIC,
     ev_to_ebitda NUMERIC,
     roe NUMERIC,
+    return_on_assets NUMERIC,
     debt_to_equity NUMERIC,
     profit_margin NUMERIC,
+    operating_margin NUMERIC,
+    gross_margin NUMERIC,
     revenue_growth NUMERIC,
+    free_cash_flow BIGINT,
     current_price NUMERIC,
     volume BIGINT,
+    price_return_6m NUMERIC,
     raw_payload JSONB,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_fundamentals_ticker_fiscal_date UNIQUE (ticker, fiscal_date)
 );
 
+-- Migration guard for existing tables
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS exchange TEXT;
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS universe VARCHAR(50) DEFAULT 'SEC';
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS trailing_pe NUMERIC;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS peg_ratio NUMERIC;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS price_to_book NUMERIC;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS return_on_assets NUMERIC;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS operating_margin NUMERIC;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS gross_margin NUMERIC;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS free_cash_flow BIGINT;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS price_return_6m NUMERIC;
+
 -- ============================================================================
 -- Indexes for Performance & Analytical Screening Queries
 -- ============================================================================
 
--- B-Tree index on foreign key ticker for fast joins and lookups
 CREATE INDEX IF NOT EXISTS idx_fundamentals_ticker 
     ON fundamentals (ticker);
 
--- Composite multi-factor index optimizing valuation and quality screening filters
 CREATE INDEX IF NOT EXISTS idx_fundamentals_screening 
     ON fundamentals (pe_forward, roe, ev_to_ebitda);
 
--- Timestamp indexes for cache staleness invalidation queries
+CREATE INDEX IF NOT EXISTS idx_companies_universe
+    ON companies (universe);
+
+CREATE INDEX IF NOT EXISTS idx_companies_sector
+    ON companies (sector);
+
 CREATE INDEX IF NOT EXISTS idx_companies_updated_at 
     ON companies (updated_at);
 
 CREATE INDEX IF NOT EXISTS idx_fundamentals_updated_at 
     ON fundamentals (updated_at);
+
