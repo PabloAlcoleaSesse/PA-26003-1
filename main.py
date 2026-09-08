@@ -45,7 +45,7 @@ def cmd_init_db(args: argparse.Namespace) -> int:
     logger.info("Initializing database schema...")
     try:
         db.init_db(schema_path=getattr(args, "schema", None))
-        print("[✓] Database schema initialized and ready.")
+        print("[✓] Database schema initialized and migrated successfully.")
         return 0
     except Exception as exc:
         logger.error("Failed to initialize database: %s", exc)
@@ -53,16 +53,17 @@ def cmd_init_db(args: argparse.Namespace) -> int:
 
 
 def cmd_sync_universe(args: argparse.Namespace) -> int:
-    """Discover all US common stocks from SEC EDGAR and persist to companies table."""
-    logger.info("Beginning SEC EDGAR stock universe synchronization...")
+    """Discover benchmark or SEC universe and persist to companies table."""
+    source = getattr(args, "source", "sp500")
+    logger.info("Synchronizing '%s' equity universe...", source)
     try:
-        stocks = universe.fetch_us_stock_universe()
+        stocks = universe.fetch_universe(source=source)
         if not stocks:
-            logger.warning("No equities were retrieved from SEC EDGAR.")
+            logger.warning("No equities were retrieved for source '%s'.", source)
             return 1
 
         total_saved = db.upsert_companies(stocks)
-        print(f"[✓] Universe synchronization complete: {total_saved} companies recorded.")
+        print(f"[✓] Universe synchronization complete: {total_saved} companies recorded for '{source.upper()}'.")
         return 0
     except Exception as exc:
         logger.error("Failed during universe sync: %s", exc)
@@ -73,15 +74,25 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     """Fetch fundamentals for stale tickers with rate limiting and concurrency."""
     workers = args.workers or settings.WORKER_CONCURRENCY
     limit = args.limit
-    max_age_days = args.max_age_days or settings.DATA_MAX_AGE_DAYS
-    tickers = getattr(args, "tickers", None)
+    max_age_days = args.max_age_days if args.max_age_days is not None else settings.DATA_MAX_AGE_DAYS
+    raw_tickers = getattr(args, "tickers", None)
+    tickers = None
+    if raw_tickers:
+        tickers = []
+        for t in raw_tickers:
+            for sub_t in t.split(","):
+                clean_t = sub_t.strip().upper()
+                if clean_t:
+                    tickers.append(clean_t)
+    uni = getattr(args, "universe", None)
 
     logger.info(
-        "Starting fundamentals fetch (workers=%d, limit=%s, max_age_days=%d, tickers=%s)...",
+        "Starting fundamentals fetch (workers=%d, limit=%s, max_age_days=%d, universe=%s, tickers=%s)...",
         workers,
         str(limit),
         max_age_days,
-        str(tickers) if tickers else "all stale",
+        uni or "all",
+        str(tickers) if tickers else "stale queue",
     )
     try:
         count = fetcher.fetch_and_persist_stale(
@@ -89,6 +100,8 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             max_workers=workers,
             max_age_days=max_age_days,
             tickers=tickers,
+            universe=uni,
+            show_progress=True,
         )
         print(f"[✓] Fundamentals fetch complete: {count} records cached.")
         return 0
@@ -99,15 +112,26 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
 def cmd_screen(args: argparse.Namespace) -> int:
     """Run quantitative multi-factor screening and display/export results."""
-    logger.info("Running quantitative stock screening...")
+    logger.info(
+        "Running quantitative stock screening (strategy: %s, universe: %s, sector: %s)...",
+        args.strategy,
+        args.universe or "all",
+        args.sector or "all",
+    )
     try:
         results = screener.run_screen(
+            strategy=args.strategy,
+            universe=args.universe,
+            sector=args.sector,
             min_market_cap=args.min_market_cap,
+            max_market_cap=getattr(args, "max_market_cap", None),
             max_pe=args.max_pe,
             min_roe=args.min_roe,
             max_de=args.max_de,
             min_dollar_volume=args.min_dollar_volume,
             max_ev_ebitda=args.max_ev_ebitda,
+            min_growth=args.min_growth,
+            min_margin=args.min_margin,
             limit=args.top,
             output_csv=args.output_csv,
             print_table=True,
@@ -120,8 +144,14 @@ def cmd_screen(args: argparse.Namespace) -> int:
 
 def cmd_run_all(args: argparse.Namespace) -> int:
     """Orchestrate the end-to-end screening pipeline."""
+    uni = getattr(args, "universe", "upcoming")
+    strat = getattr(args, "strategy", "upcoming_breakouts")
+    limit = args.limit
+    workers = args.workers or settings.WORKER_CONCURRENCY
+
     print("=================================================================")
     print("      STOCK SCREENER & FUNDAMENTAL ANALYSIS PIPELINE            ")
+    print(f"      Universe: {uni.upper()}  •  Strategy: {strat.upper()}     ")
     print("=================================================================\n")
 
     # Step 1: Initialize Database
@@ -132,33 +162,37 @@ def cmd_run_all(args: argparse.Namespace) -> int:
         logger.error("Database migration failed: %s", exc)
         return 1
 
-    # Step 2: Sync Universe from SEC
-    logger.info("[Step 2/4] Synchronizing SEC EDGAR universe...")
+    # Step 2: Sync Universe
+    logger.info("[Step 2/4] Synchronizing benchmark universe '%s'...", uni)
     try:
-        stocks = universe.fetch_us_stock_universe()
+        stocks = universe.fetch_universe(source=uni)
         db.upsert_companies(stocks)
     except Exception as exc:
         logger.error("Universe sync failed: %s", exc)
         return 1
 
     # Step 3: Fetch Fundamentals
-    workers = args.workers or settings.WORKER_CONCURRENCY
-    limit = args.limit
     logger.info("[Step 3/4] Fetching fundamentals (workers=%d, limit=%s)...", workers, str(limit))
     try:
         fetcher.fetch_and_persist_stale(
             limit=limit,
             max_workers=workers,
             max_age_days=settings.DATA_MAX_AGE_DAYS,
+            universe=uni,
+            show_progress=True,
         )
     except Exception as exc:
         logger.error("Fundamentals fetch failed: %s", exc)
         return 1
 
     # Step 4: Run Screen & Scoring
-    logger.info("[Step 4/4] Executing multi-factor screen...")
+    logger.info("[Step 4/4] Executing '%s' multi-factor screen...", strat)
     try:
         screener.run_screen(
+            strategy=strat,
+            universe=uni,
+            sector=getattr(args, "sector", None),
+            max_market_cap=getattr(args, "max_market_cap", None),
             limit=args.top,
             output_csv=args.output_csv,
             print_table=True,
@@ -175,7 +209,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Build and configure the command-line argument parser."""
     parser = argparse.ArgumentParser(
         prog="stock_screener",
-        description="Production-grade Stock Screening & Fundamental Analysis Pipeline",
+        description="Production-grade Institutional Stock Screening & Pattern Recognition Pipeline",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -205,7 +239,14 @@ def build_parser() -> argparse.ArgumentParser:
     # Subcommand: sync-universe
     p_sync = subparsers.add_parser(
         "sync-universe",
-        help="Fetch US common stock universe from SEC EDGAR and populate database.",
+        help="Fetch benchmark or SEC universe and populate database.",
+    )
+    p_sync.add_argument(
+        "--source",
+        type=str,
+        choices=["sp500", "sp400", "upcoming", "nasdaq100", "dow30", "sec", "all"],
+        default="upcoming",
+        help="Benchmark universe source (default: upcoming).",
     )
     p_sync.set_defaults(func=cmd_sync_universe)
 
@@ -213,6 +254,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_fetch = subparsers.add_parser(
         "fetch",
         help="Concurrently fetch and cache latest fundamental metrics for stale tickers.",
+    )
+    p_fetch.add_argument(
+        "--universe",
+        type=str,
+        default=None,
+        help="Optional universe filter (e.g. upcoming, sp400, sp500, nasdaq100).",
     )
     p_fetch.add_argument(
         "--workers",
@@ -224,7 +271,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit",
         type=int,
         default=None,
-        help="Maximum number of stale tickers to fetch in this run (e.g. 100).",
+        help="Maximum number of stale tickers to fetch in this run (e.g. 50).",
     )
     p_fetch.add_argument(
         "--max-age-days",
@@ -236,14 +283,41 @@ def build_parser() -> argparse.ArgumentParser:
         "--tickers",
         nargs="+",
         default=None,
-        help="Optional explicit list of tickers to fetch (e.g. --tickers AAPL MSFT NVDA).",
+        help="Optional explicit list of tickers to fetch (e.g. --tickers APP PLTR CRWD).",
     )
     p_fetch.set_defaults(func=cmd_fetch)
 
     # Subcommand: screen
     p_screen = subparsers.add_parser(
         "screen",
-        help="Screen and rank cached stocks against institutional multi-factor criteria.",
+        help="Screen and rank stocks using 4-pillar model & technical pattern recognition.",
+    )
+    p_screen.add_argument(
+        "--strategy",
+        type=str,
+        choices=[
+            "upcoming_breakouts",
+            "minervini_trend",
+            "balanced",
+            "quality_compounders",
+            "garp",
+            "deep_value",
+            "high_growth_momentum",
+        ],
+        default="upcoming_breakouts",
+        help="Quantitative investment strategy preset (default: upcoming_breakouts).",
+    )
+    p_screen.add_argument(
+        "--universe",
+        type=str,
+        default=None,
+        help="Filter by benchmark universe (e.g. upcoming, sp400, sp500, nasdaq100).",
+    )
+    p_screen.add_argument(
+        "--sector",
+        type=str,
+        default=None,
+        help="Filter by economic sector (e.g. Technology, Healthcare, Financials).",
     )
     p_screen.add_argument(
         "--top",
@@ -262,6 +336,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=screener.DEFAULT_MIN_MARKET_CAP,
         help=f"Minimum Market Cap in USD (default: {screener.DEFAULT_MIN_MARKET_CAP}).",
+    )
+    p_screen.add_argument(
+        "--max-market-cap",
+        type=int,
+        default=None,
+        help="Maximum Market Cap in USD (e.g. 35000000000 for mid-caps).",
     )
     p_screen.add_argument(
         "--max-pe",
@@ -293,12 +373,44 @@ def build_parser() -> argparse.ArgumentParser:
         default=screener.DEFAULT_MAX_EV_EBITDA,
         help=f"Maximum EV/EBITDA multiple (default: {screener.DEFAULT_MAX_EV_EBITDA}).",
     )
+    p_screen.add_argument(
+        "--min-growth",
+        type=float,
+        default=0.0,
+        help="Minimum YoY revenue growth rate (default: 0.0, discards contracting businesses).",
+    )
+    p_screen.add_argument(
+        "--min-margin",
+        type=float,
+        default=0.03,
+        help="Minimum operating/net margin (default: 0.03).",
+    )
     p_screen.set_defaults(func=cmd_screen)
 
     # Subcommand: run-all
     p_all = subparsers.add_parser(
         "run-all",
         help="Orchestrate end-to-end pipeline: init-db -> sync-universe -> fetch -> screen.",
+    )
+    p_all.add_argument(
+        "--universe",
+        type=str,
+        choices=["sp500", "nasdaq100", "dow30", "sec", "all"],
+        default="sp500",
+        help="Target equity universe (default: sp500).",
+    )
+    p_all.add_argument(
+        "--strategy",
+        type=str,
+        choices=["balanced", "quality_compounders", "garp", "deep_value", "high_growth_momentum"],
+        default="balanced",
+        help="Quantitative investment strategy preset (default: balanced).",
+    )
+    p_all.add_argument(
+        "--sector",
+        type=str,
+        default=None,
+        help="Optional sector filter (e.g. Technology).",
     )
     p_all.add_argument(
         "--workers",
@@ -309,14 +421,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_all.add_argument(
         "--limit",
         type=int,
-        default=100,
-        help="Number of stale tickers to fetch during run-all (default: 100).",
+        default=50,
+        help="Number of stale tickers to fetch during run-all (default: 50).",
     )
     p_all.add_argument(
         "--top",
         type=int,
-        default=25,
-        help="Number of top-ranked stocks to output (default: 25).",
+        default=20,
+        help="Number of top-ranked stocks to output (default: 20).",
     )
     p_all.add_argument(
         "--output-csv",
@@ -353,3 +465,4 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
+

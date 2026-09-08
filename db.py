@@ -51,6 +51,8 @@ def get_pool() -> ConnectionPool:
                     conninfo=settings.conn_string,
                     min_size=settings.DB_MIN_POOL_SIZE,
                     max_size=settings.DB_MAX_POOL_SIZE,
+                    timeout=10,
+                    reconnect_timeout=10,
                     open=True,
                     kwargs={"row_factory": dict_row, "autocommit": False},
                 )
@@ -124,27 +126,21 @@ def upsert_company(
     cik: str,
     sector: str | None = None,
     industry: str | None = None,
+    exchange: str | None = None,
+    universe: str = "SEC",
     is_active: bool = True,
 ) -> None:
-    """
-    Insert or update a single company record in the companies table.
-
-    Args:
-        ticker: Stock ticker symbol (primary key).
-        name: Official company legal or trade name.
-        cik: 10-digit zero-padded SEC Central Index Key.
-        sector: Economic sector name (optional).
-        industry: Industry subcategory name (optional).
-        is_active: Whether the equity is actively trading.
-    """
+    """Insert or update a single company record in the companies table."""
     sql = """
-        INSERT INTO companies (ticker, name, cik, sector, industry, is_active, updated_at)
-        VALUES (%(ticker)s, %(name)s, %(cik)s, %(sector)s, %(industry)s, %(is_active)s, NOW())
+        INSERT INTO companies (ticker, name, cik, sector, industry, exchange, universe, is_active, updated_at)
+        VALUES (%(ticker)s, %(name)s, %(cik)s, %(sector)s, %(industry)s, %(exchange)s, %(universe)s, %(is_active)s, NOW())
         ON CONFLICT (ticker) DO UPDATE SET
             name = EXCLUDED.name,
             cik = EXCLUDED.cik,
             sector = COALESCE(EXCLUDED.sector, companies.sector),
             industry = COALESCE(EXCLUDED.industry, companies.industry),
+            exchange = COALESCE(EXCLUDED.exchange, companies.exchange),
+            universe = CASE WHEN companies.universe = 'SEC' AND EXCLUDED.universe != 'SEC' THEN EXCLUDED.universe ELSE companies.universe END,
             is_active = EXCLUDED.is_active,
             updated_at = NOW();
     """
@@ -158,17 +154,47 @@ def upsert_company(
                     "cik": cik.strip(),
                     "sector": sector,
                     "industry": industry,
+                    "exchange": exchange,
+                    "universe": universe,
                     "is_active": is_active,
+                },
+            )
+
+
+def update_company_profile(
+    ticker: str,
+    sector: str | None = None,
+    industry: str | None = None,
+    exchange: str | None = None,
+) -> None:
+    """Update company sector and industry classifications discovered during fetching."""
+    sql = """
+        UPDATE companies
+        SET sector = COALESCE(%(sector)s, sector),
+            industry = COALESCE(%(industry)s, industry),
+            exchange = COALESCE(%(exchange)s, exchange),
+            updated_at = NOW()
+        WHERE ticker = %(ticker)s;
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql,
+                {
+                    "ticker": ticker.upper().strip(),
+                    "sector": sector,
+                    "industry": industry,
+                    "exchange": exchange,
                 },
             )
 
 
 def upsert_companies(records: list[dict[str, Any]], batch_size: int = 1000) -> int:
     """
-    Bulk insert or update companies discovered from SEC EDGAR.
+    Bulk insert or update companies discovered from benchmarks or SEC EDGAR.
 
     Args:
-        records: List of dictionaries with keys: ticker, name, cik, and optional sector, industry, is_active.
+        records: List of dictionaries with keys: ticker, name, cik, universe, sector, industry.
         batch_size: Number of records per executemany chunk.
 
     Returns:
@@ -178,13 +204,15 @@ def upsert_companies(records: list[dict[str, Any]], batch_size: int = 1000) -> i
         return 0
 
     sql = """
-        INSERT INTO companies (ticker, name, cik, sector, industry, is_active, updated_at)
-        VALUES (%(ticker)s, %(name)s, %(cik)s, %(sector)s, %(industry)s, %(is_active)s, NOW())
+        INSERT INTO companies (ticker, name, cik, sector, industry, exchange, universe, is_active, updated_at)
+        VALUES (%(ticker)s, %(name)s, %(cik)s, %(sector)s, %(industry)s, %(exchange)s, %(universe)s, %(is_active)s, NOW())
         ON CONFLICT (ticker) DO UPDATE SET
             name = EXCLUDED.name,
             cik = EXCLUDED.cik,
             sector = COALESCE(EXCLUDED.sector, companies.sector),
             industry = COALESCE(EXCLUDED.industry, companies.industry),
+            exchange = COALESCE(EXCLUDED.exchange, companies.exchange),
+            universe = CASE WHEN companies.universe = 'SEC' AND EXCLUDED.universe != 'SEC' THEN EXCLUDED.universe ELSE companies.universe END,
             is_active = EXCLUDED.is_active,
             updated_at = NOW();
     """
@@ -193,9 +221,11 @@ def upsert_companies(records: list[dict[str, Any]], batch_size: int = 1000) -> i
         {
             "ticker": r["ticker"].upper().strip(),
             "name": r["name"].strip(),
-            "cik": str(r["cik"]).zfill(10),
+            "cik": str(r.get("cik", "0")).zfill(10),
             "sector": r.get("sector"),
             "industry": r.get("industry"),
+            "exchange": r.get("exchange"),
+            "universe": r.get("universe", "SEC"),
             "is_active": r.get("is_active", True),
         }
         for r in records
@@ -208,7 +238,6 @@ def upsert_companies(records: list[dict[str, Any]], batch_size: int = 1000) -> i
                 chunk = sanitized_records[i : i + batch_size]
                 cur.executemany(sql, chunk)
                 total_inserted += len(chunk)
-                logger.debug("Upserted %d / %d companies...", total_inserted, len(sanitized_records))
 
     logger.info("Successfully upserted %d companies into PostgreSQL.", total_inserted)
     return total_inserted
@@ -216,7 +245,7 @@ def upsert_companies(records: list[dict[str, Any]], batch_size: int = 1000) -> i
 
 def upsert_fundamentals(records: list[dict[str, Any]], batch_size: int = 500) -> int:
     """
-    Bulk upsert fundamental financial data using executemany with conflict resolution.
+    Bulk upsert fundamental financial data including quality, valuation, and momentum.
 
     Args:
         records: List of dictionaries representing fundamentals rows.
@@ -235,13 +264,26 @@ def upsert_fundamentals(records: list[dict[str, Any]], batch_size: int = 500) ->
             filing_date,
             market_cap,
             pe_forward,
+            trailing_pe,
+            peg_ratio,
+            price_to_book,
             ev_to_ebitda,
             roe,
+            return_on_assets,
             debt_to_equity,
             profit_margin,
+            operating_margin,
+            gross_margin,
             revenue_growth,
+            free_cash_flow,
             current_price,
             volume,
+            price_return_6m,
+            pattern_score,
+            detected_patterns,
+            dist_52w_high,
+            rsi_14,
+            ud_volume_ratio,
             raw_payload,
             updated_at
         ) VALUES (
@@ -250,13 +292,26 @@ def upsert_fundamentals(records: list[dict[str, Any]], batch_size: int = 500) ->
             %(filing_date)s,
             %(market_cap)s,
             %(pe_forward)s,
+            %(trailing_pe)s,
+            %(peg_ratio)s,
+            %(price_to_book)s,
             %(ev_to_ebitda)s,
             %(roe)s,
+            %(return_on_assets)s,
             %(debt_to_equity)s,
             %(profit_margin)s,
+            %(operating_margin)s,
+            %(gross_margin)s,
             %(revenue_growth)s,
+            %(free_cash_flow)s,
             %(current_price)s,
             %(volume)s,
+            %(price_return_6m)s,
+            %(pattern_score)s,
+            %(detected_patterns)s,
+            %(dist_52w_high)s,
+            %(rsi_14)s,
+            %(ud_volume_ratio)s,
             %(raw_payload)s,
             NOW()
         )
@@ -264,13 +319,26 @@ def upsert_fundamentals(records: list[dict[str, Any]], batch_size: int = 500) ->
             filing_date = EXCLUDED.filing_date,
             market_cap = EXCLUDED.market_cap,
             pe_forward = EXCLUDED.pe_forward,
+            trailing_pe = EXCLUDED.trailing_pe,
+            peg_ratio = EXCLUDED.peg_ratio,
+            price_to_book = EXCLUDED.price_to_book,
             ev_to_ebitda = EXCLUDED.ev_to_ebitda,
             roe = EXCLUDED.roe,
+            return_on_assets = EXCLUDED.return_on_assets,
             debt_to_equity = EXCLUDED.debt_to_equity,
             profit_margin = EXCLUDED.profit_margin,
+            operating_margin = EXCLUDED.operating_margin,
+            gross_margin = EXCLUDED.gross_margin,
             revenue_growth = EXCLUDED.revenue_growth,
+            free_cash_flow = EXCLUDED.free_cash_flow,
             current_price = EXCLUDED.current_price,
             volume = EXCLUDED.volume,
+            price_return_6m = EXCLUDED.price_return_6m,
+            pattern_score = EXCLUDED.pattern_score,
+            detected_patterns = EXCLUDED.detected_patterns,
+            dist_52w_high = EXCLUDED.dist_52w_high,
+            rsi_14 = EXCLUDED.rsi_14,
+            ud_volume_ratio = EXCLUDED.ud_volume_ratio,
             raw_payload = EXCLUDED.raw_payload,
             updated_at = NOW();
     """
@@ -287,13 +355,26 @@ def upsert_fundamentals(records: list[dict[str, Any]], batch_size: int = 500) ->
             "filing_date": r.get("filing_date"),
             "market_cap": r.get("market_cap"),
             "pe_forward": r.get("pe_forward"),
+            "trailing_pe": r.get("trailing_pe"),
+            "peg_ratio": r.get("peg_ratio"),
+            "price_to_book": r.get("price_to_book"),
             "ev_to_ebitda": r.get("ev_to_ebitda"),
             "roe": r.get("roe"),
+            "return_on_assets": r.get("return_on_assets"),
             "debt_to_equity": r.get("debt_to_equity"),
             "profit_margin": r.get("profit_margin"),
+            "operating_margin": r.get("operating_margin"),
+            "gross_margin": r.get("gross_margin"),
             "revenue_growth": r.get("revenue_growth"),
+            "free_cash_flow": r.get("free_cash_flow"),
             "current_price": r.get("current_price"),
             "volume": r.get("volume"),
+            "price_return_6m": r.get("price_return_6m"),
+            "pattern_score": r.get("pattern_score", 50.0),
+            "detected_patterns": r.get("detected_patterns", "Neutral"),
+            "dist_52w_high": r.get("dist_52w_high"),
+            "rsi_14": r.get("rsi_14"),
+            "ud_volume_ratio": r.get("ud_volume_ratio"),
             "raw_payload": payload,
         })
 
@@ -311,22 +392,44 @@ def upsert_fundamentals(records: list[dict[str, Any]], batch_size: int = 500) ->
 
 def get_stale_tickers(
     tickers: Sequence[str] | None = None,
+    universe: str | None = None,
     max_age_days: int = 30,
 ) -> list[str]:
     """
-    Identify tickers that have no cached fundamentals or whose latest record is older than max_age_days.
+    Identify tickers requiring fundamental data fetching.
+    Prioritizes benchmark universes (S&P 500, Nasdaq 100) first to avoid alphabetical bias.
 
     Args:
-        tickers: Optional list of tickers to filter against. If None, checks all active companies.
-        max_age_days: Number of days before cached data is deemed stale.
+        tickers: Explicit tickers list.
+        universe: Optional universe filter (e.g. 'SP500', 'NASDAQ100').
+        max_age_days: Cache freshness threshold.
 
     Returns:
-        list[str]: Sorted list of stale ticker symbols.
+        List of tickers ordered by benchmark priority.
     """
     if tickers is not None and len(tickers) == 0:
         return []
 
-    base_query = """
+    filters = ["c.is_active = TRUE"]
+    params: dict[str, Any] = {"max_age_days": max_age_days}
+
+    if universe:
+        if universe.upper().strip() == "UPCOMING":
+            from universe import UPCOMING_GROWTH_TICKERS
+            filters.append("(c.universe = 'UPCOMING' OR c.ticker = ANY(%(upcoming_tickers)s))")
+            params["upcoming_tickers"] = list(UPCOMING_GROWTH_TICKERS)
+        else:
+            filters.append("c.universe = %(universe)s")
+            params["universe"] = universe.upper().strip()
+
+    if tickers:
+        clean_tickers = [t.upper().strip() for t in tickers]
+        filters.append("c.ticker = ANY(%(tickers)s)")
+        params["tickers"] = clean_tickers
+
+    where_clause = " AND ".join(filters)
+
+    query = f"""
         SELECT c.ticker
         FROM companies c
         LEFT JOIN (
@@ -334,23 +437,20 @@ def get_stale_tickers(
             FROM fundamentals
             GROUP BY ticker
         ) f ON c.ticker = f.ticker
-        WHERE c.is_active = TRUE
-          {ticker_filter}
+        WHERE {where_clause}
           AND (
               f.latest_update IS NULL
               OR f.latest_update < NOW() - (%(max_age_days)s || ' days')::INTERVAL
           )
-        ORDER BY c.ticker ASC;
+        ORDER BY
+            CASE
+                WHEN c.universe = 'SP500' THEN 1
+                WHEN c.universe = 'NASDAQ100' THEN 2
+                WHEN c.universe = 'DOW30' THEN 3
+                ELSE 4
+            END,
+            c.ticker ASC;
     """
-
-    params: dict[str, Any] = {"max_age_days": max_age_days}
-
-    if tickers:
-        clean_tickers = [t.upper().strip() for t in tickers]
-        query = base_query.format(ticker_filter="AND c.ticker = ANY(%(tickers)s)")
-        params["tickers"] = clean_tickers
-    else:
-        query = base_query.format(ticker_filter="")
 
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -359,8 +459,9 @@ def get_stale_tickers(
 
     stale_list = [row["ticker"] for row in rows]
     logger.info(
-        "Identified %d stale tickers (cache threshold: %d days).",
+        "Identified %d stale tickers (universe: %s, cache threshold: %d days).",
         len(stale_list),
+        universe or "all",
         max_age_days,
     )
     return stale_list
@@ -368,46 +469,98 @@ def get_stale_tickers(
 
 def query_screened_stocks(
     min_market_cap: int = 500_000_000,
-    max_pe: float = 30.0,
-    min_roe: float = 0.12,
-    max_de: float = 180.0,
+    max_market_cap: int | None = None,
+    max_pe: float = 40.0,
+    min_roe: float = 0.10,
+    max_de: float = 200.0,
     min_dollar_volume: float = 2_000_000.0,
-    max_ev_ebitda: float = 22.0,
-    limit: int = 25,
+    max_ev_ebitda: float = 30.0,
+    min_growth: float | None = 0.0,
+    min_margin: float | None = 0.03,
+    min_pattern_score: float | None = None,
+    universe: str | None = None,
+    sector: str | None = None,
+    limit: int = 50,
 ) -> list[dict[str, Any]]:
     """
-    Execute the multi-factor fundamental quantitative screening query in pure SQL.
-
-    Filtering Rules Applied in SQL:
-      1. Market Cap >= $500,000,000 (min_market_cap)
-      2. Avg Dollar Volume (Current Price * Volume) >= $2,000,000 (min_dollar_volume)
-      3. 0 < Forward P/E < 30 (max_pe)
-      4. Return on Equity (ROE) > 12% (min_roe)
-      5. Debt-to-Equity < 180 (1.8x) (max_de)
-      6. EV / EBITDA between 0 and 22 (max_ev_ebitda)
-
-    Factor Scoring Formula:
-      Score = (ROE * 40) + (Profit Margin * 30) + (Revenue Growth * 20) - (Forward P/E * 0.5)
+    Retrieve candidate stocks with enriched fundamentals & technical pattern metrics.
 
     Args:
-        min_market_cap: Minimum market capitalization in USD.
-        max_pe: Maximum forward P/E ratio ceiling.
-        min_roe: Minimum Return on Equity (expressed as decimal, e.g. 0.12 for 12%).
-        max_de: Maximum Debt-to-Equity ratio.
-        min_dollar_volume: Minimum daily dollar trading volume.
-        max_ev_ebitda: Maximum EV/EBITDA ratio ceiling.
-        limit: Maximum number of screened stocks to return.
+        min_market_cap: Minimum market cap in USD.
+        max_market_cap: Maximum market cap in USD (for targeting emerging mid-caps).
+        max_pe: Maximum forward P/E.
+        min_roe: Minimum Return on Equity.
+        max_de: Maximum Debt/Equity ratio.
+        min_dollar_volume: Minimum daily dollar volume.
+        max_ev_ebitda: Maximum EV/EBITDA multiple.
+        min_growth: Minimum YoY revenue growth.
+        min_margin: Minimum operating or net margin.
+        min_pattern_score: Minimum technical pattern score (0 - 100).
+        universe: Benchmark universe filter ('SP500', 'SP400', 'UPCOMING', etc.).
+        sector: Economic sector filter ('Technology', 'Healthcare', etc.).
+        limit: Max candidates to retrieve.
 
     Returns:
-        list[dict[str, Any]]: Ranked list of matching equities ordered by factor score descending.
+        List of matching equity records.
     """
-    # Normalize ROE if supplied as percentage (> 1.0)
-    effective_min_roe = min_roe / 100.0 if min_roe > 1.0 else min_roe
+    where_clauses = [
+        "c.is_active = TRUE",
+        "lf.market_cap >= %(min_market_cap)s",
+        "lf.dollar_volume >= %(min_dollar_volume)s",
+    ]
 
-    # Normalize Debt/Equity if supplied as decimal (< 5.0)
-    effective_max_de = max_de * 100.0 if 0 < max_de < 5.0 else max_de
+    params: dict[str, Any] = {
+        "min_market_cap": min_market_cap,
+        "min_dollar_volume": min_dollar_volume,
+        "limit": limit,
+    }
 
-    sql = """
+    if max_pe is not None:
+        where_clauses.append("lf.pe_forward > 0 AND lf.pe_forward <= %(max_pe)s")
+        params["max_pe"] = max_pe
+
+    if min_roe is not None:
+        effective_min_roe = min_roe / 100.0 if min_roe > 1.0 else min_roe
+        where_clauses.append("lf.roe >= %(min_roe)s")
+        params["min_roe"] = effective_min_roe
+
+    if max_de is not None:
+        effective_max_de = max_de * 100.0 if 0 < max_de < 5.0 else max_de
+        where_clauses.append("(lf.debt_to_equity IS NULL OR (lf.debt_to_equity >= 0 AND lf.debt_to_equity <= %(max_de)s))")
+        params["max_de"] = effective_max_de
+
+    if max_market_cap is not None:
+        where_clauses.append("lf.market_cap <= %(max_market_cap)s")
+        params["max_market_cap"] = max_market_cap
+
+    if min_pattern_score is not None:
+        where_clauses.append("lf.pattern_score IS NOT NULL AND lf.pattern_score >= %(min_pattern_score)s")
+        params["min_pattern_score"] = min_pattern_score
+
+    if universe:
+        if universe.upper().strip() == "UPCOMING":
+            from universe import UPCOMING_GROWTH_TICKERS
+            where_clauses.append("(c.universe = 'UPCOMING' OR c.ticker = ANY(%(upcoming_tickers)s))")
+            params["upcoming_tickers"] = list(UPCOMING_GROWTH_TICKERS)
+        else:
+            where_clauses.append("c.universe = %(universe)s")
+            params["universe"] = universe.upper().strip()
+
+    if sector:
+        where_clauses.append("LOWER(c.sector) LIKE LOWER(%(sector)s)")
+        params["sector"] = f"%{sector.strip()}%"
+
+    if min_growth is not None:
+        where_clauses.append("lf.revenue_growth >= %(min_growth)s")
+        params["min_growth"] = min_growth
+
+    if min_margin is not None:
+        where_clauses.append("(lf.profit_margin >= %(min_margin)s OR lf.operating_margin >= %(min_margin)s)")
+        params["min_margin"] = min_margin
+
+    where_sql = " AND ".join(where_clauses)
+
+    sql = f"""
         WITH latest_fundamentals AS (
             SELECT DISTINCT ON (f.ticker)
                 f.id,
@@ -416,13 +569,26 @@ def query_screened_stocks(
                 f.filing_date,
                 f.market_cap,
                 f.pe_forward,
+                f.trailing_pe,
+                f.peg_ratio,
+                f.price_to_book,
                 f.ev_to_ebitda,
                 f.roe,
+                f.return_on_assets,
                 f.debt_to_equity,
                 f.profit_margin,
+                f.operating_margin,
+                f.gross_margin,
                 f.revenue_growth,
+                f.free_cash_flow,
                 f.current_price,
                 f.volume,
+                f.price_return_6m,
+                f.pattern_score,
+                f.detected_patterns,
+                f.dist_52w_high,
+                f.rsi_14,
+                f.ud_volume_ratio,
                 (f.current_price * f.volume) AS dollar_volume,
                 f.updated_at
             FROM fundamentals f
@@ -433,51 +599,44 @@ def query_screened_stocks(
             c.name,
             c.sector,
             c.industry,
+            c.universe,
             lf.market_cap,
             lf.pe_forward,
+            lf.trailing_pe,
+            lf.peg_ratio,
+            lf.price_to_book,
             lf.ev_to_ebitda,
             lf.roe,
+            lf.return_on_assets,
             lf.debt_to_equity,
             lf.profit_margin,
+            lf.operating_margin,
+            lf.gross_margin,
             lf.revenue_growth,
+            lf.free_cash_flow,
             lf.current_price,
             lf.volume,
             lf.dollar_volume,
-            lf.fiscal_date,
-            ROUND(
-                (COALESCE(lf.roe, 0) * 40.0)
-                + (COALESCE(lf.profit_margin, 0) * 30.0)
-                + (COALESCE(lf.revenue_growth, 0) * 20.0)
-                - (COALESCE(lf.pe_forward, 0) * 0.5),
-                4
-            ) AS factor_score
+            lf.price_return_6m,
+            lf.pattern_score,
+            lf.detected_patterns,
+            lf.dist_52w_high,
+            lf.rsi_14,
+            lf.ud_volume_ratio,
+            lf.fiscal_date
         FROM latest_fundamentals lf
         JOIN companies c ON c.ticker = lf.ticker
-        WHERE c.is_active = TRUE
-          AND lf.market_cap >= %(min_market_cap)s
-          AND lf.dollar_volume >= %(min_dollar_volume)s
-          AND lf.pe_forward > 0 AND lf.pe_forward < %(max_pe)s
-          AND lf.roe > %(min_roe)s
-          AND lf.debt_to_equity >= 0 AND lf.debt_to_equity < %(max_de)s
-          AND lf.ev_to_ebitda > 0 AND lf.ev_to_ebitda <= %(max_ev_ebitda)s
-        ORDER BY factor_score DESC
+        WHERE {where_sql}
+        ORDER BY lf.market_cap DESC
         LIMIT %(limit)s;
     """
-
-    params = {
-        "min_market_cap": min_market_cap,
-        "min_dollar_volume": min_dollar_volume,
-        "max_pe": max_pe,
-        "min_roe": effective_min_roe,
-        "max_de": effective_max_de,
-        "max_ev_ebitda": max_ev_ebitda,
-        "limit": limit,
-    }
 
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
 
-    logger.info("Screening query returned %d passing equities.", len(rows))
+    logger.info("Screening query candidate pool: %d equities retrieved.", len(rows))
     return list(rows)
+
+
