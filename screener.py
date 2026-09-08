@@ -9,18 +9,109 @@ Formats results into rich CLI tables and exports CSV reports.
 from __future__ import annotations
 
 import csv
+from collections import Counter
 import logging
+import json
+import hashlib
+import math
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from rich.console import Console
-from rich.panel import Panel
+from rich import box
 from rich.table import Table
 
 import db
 
 logger = logging.getLogger(__name__)
 console = Console()
+
+STRATEGY_ALIASES = {"upcoming": "upcoming_breakouts", "breakout": "upcoming_breakouts", "minervini": "minervini_trend"}
+TREND_STRATEGIES = {"upcoming_breakouts", "minervini_trend", "high_growth_momentum"}
+
+
+def _finite(value: Any) -> bool:
+    try:
+        return value is not None and math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _eligibility(row: dict[str, Any], strategy: str, as_of: date,
+                 max_price_age_days: int, min_pattern_score: float | None) -> list[str]:
+    reasons = []
+    try:
+        price_date = date.fromisoformat(str(row.get("price_as_of"))[:10])
+        age = (as_of - price_date).days
+        if age < 0:
+            reasons.append("price_date_in_future")
+        elif age > max_price_age_days:
+            reasons.append("stale_price")
+    except (ValueError, TypeError):
+        reasons.append("missing_price_date")
+    if not _finite(row.get("current_price")) or float(row["current_price"]) <= 0:
+        reasons.append("invalid_price")
+    if strategy in TREND_STRATEGIES:
+        if row.get("technical_valid") not in (True, 1):
+            reasons.append("technical_data_unavailable")
+        if row.get("is_stage_2") not in (True, 1):
+            rules_passed = row.get("stage_2_rules_passed", 0) or 0
+            if rules_passed < 5:
+                reasons.append("uptrend_not_confirmed")
+        for period in ("1m", "3m", "6m"):
+            value = row.get(f"price_return_{period}")
+            if not _finite(value):
+                reasons.append(f"missing_return_{period}")
+            elif period != "1m" and float(value) <= 0:
+                reasons.append(f"nonpositive_return_{period}")
+        relative = row.get("relative_return_3m")
+        if not _finite(relative):
+            reasons.append("benchmark_comparison_unavailable")
+        elif float(relative) < -0.03:
+            reasons.append("underperforming_benchmark_3m")
+        if strategy == "upcoming_breakouts" and not (
+            row.get("is_vcp") in (True, 1) or row.get("is_breakout") in (True, 1)
+        ):
+            reasons.append("no_breakout_setup")
+    if min_pattern_score is not None:
+        pattern = row.get("pattern_score")
+        if not _finite(pattern):
+            reasons.append("pattern_score_unavailable")
+        elif float(pattern) < min_pattern_score:
+            reasons.append("pattern_score_below_minimum")
+    return reasons
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Cannot serialize {type(value).__name__}")
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (float, Decimal)) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _implementation_fingerprint() -> str:
+    digest = hashlib.sha256()
+    for name in ("db.py", "fetcher.py", "patterns.py", "screener.py"):
+        digest.update(name.encode("utf-8") + b"\0")
+        digest.update((Path(__file__).parent / name).read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 # Institutional Screening Filter Default Thresholds
 DEFAULT_MIN_MARKET_CAP = 500_000_000        # $500M minimum capitalization
@@ -41,10 +132,10 @@ STRATEGY_PROFILES: dict[str, dict[str, float]] = {
     },
     "upcoming_breakouts": {
         "pattern": 0.35,
-        "growth": 0.30,
+        "growth": 0.25,
         "quality": 0.20,
-        "valuation": 0.15,
-        "momentum": 0.00,
+        "momentum": 0.10,
+        "valuation": 0.10,
     },
     "minervini_trend": {
         "pattern": 0.45,
@@ -239,13 +330,14 @@ def calculate_composite_score(row: dict[str, Any], strategy: str = "balanced") -
     Returns:
         Dict with keys: quality, growth, valuation, momentum, pattern, composite.
     """
-    weights = STRATEGY_PROFILES.get(strategy.lower(), STRATEGY_PROFILES["balanced"])
+    canonical = STRATEGY_ALIASES.get(strategy.lower().strip(), strategy.lower().strip())
+    weights = STRATEGY_PROFILES.get(canonical, STRATEGY_PROFILES["balanced"])
 
     q_score = score_quality(row)
     g_score = score_growth(row)
     v_score = score_valuation(row)
     m_score = score_momentum(row)
-    p_score = float(row.get("pattern_score") or 50.0)
+    p_score = float(row["pattern_score"]) if _finite(row.get("pattern_score")) else 0.0
 
     composite = (
         (q_score * weights.get("quality", 0.0))
@@ -313,6 +405,10 @@ def run_screen(
     limit: int = 25,
     output_csv: str | Path | None = "screened_results.csv",
     print_table: bool = True,
+    include_watchlist: bool = False,
+    max_price_age_days: int = 5,
+    as_of: date | None = None,
+    audit_dir: str | Path | None = "runs",
 ) -> list[dict[str, Any]]:
     """
     Execute institutional multi-factor quantitative equity screening with pattern recognition.
@@ -338,8 +434,15 @@ def run_screen(
     Returns:
         List of screened and scored stock records.
     """
+    # as_of is a testing clock, not a historical backtest: fundamentals are current.
+    screen_date = as_of or datetime.now(timezone.utc).date()
+    if max_price_age_days < 0 or limit < 0:
+        raise ValueError("max_price_age_days and limit must be nonnegative")
     # Adjust thresholds based on strategy presets
     strat = strategy.lower().strip()
+    strat = STRATEGY_ALIASES.get(strat, strat)
+    if strat not in STRATEGY_PROFILES:
+        raise ValueError(f"Unknown strategy: {strategy}")
     if strat in ("upcoming_breakouts", "upcoming", "breakout"):
         # Sweet spot for upcoming stocks: $1B to $80B mid/growth-caps with accelerating growth and technical setups
         max_market_cap = max_market_cap or 80_000_000_000
@@ -383,20 +486,26 @@ def run_screen(
         max_ev_ebitda=max_ev_ebitda,
         min_growth=min_growth,
         min_margin=min_margin,
-        min_pattern_score=min_pattern_score,
+        min_pattern_score=None,
         universe=universe,
         sector=sector,
-        limit=200,  # Retrieve wider candidate pool for composite ranking
+        limit=None,
     )
-
-    if not raw_candidates:
-        if print_table:
-            console.print("\n[bold red][!] No stocks matched the current screening & pattern criteria.[/]\n")
-        return []
 
     # Score each candidate across all pillars
     scored_candidates = []
-    for row in raw_candidates:
+    for original in raw_candidates:
+        row = dict(original)
+        row["inputs"] = dict(original)
+        reasons = _eligibility(row, strat, screen_date, max_price_age_days, min_pattern_score)
+        row["eligibility_reasons"] = reasons
+        row["eligible"] = not reasons
+        row["setup_status"] = "Watchlist"
+        if not reasons and row.get("technical_valid") in (True, 1) and row.get("is_stage_2") in (True, 1):
+            if row.get("is_breakout") in (True, 1):
+                row["setup_status"] = "Confirmed breakout"
+            elif row.get("is_vcp") in (True, 1):
+                row["setup_status"] = "Setup forming"
         scores = calculate_composite_score(row, strategy=strat)
         row["quality_score"] = scores["quality"]
         row["growth_score"] = scores["growth"]
@@ -408,19 +517,81 @@ def run_screen(
 
     # Sort by composite factor score descending
     scored_candidates.sort(key=lambda r: r["factor_score"], reverse=True)
-    results = scored_candidates[:limit]
+    selectable = [row for row in scored_candidates if row["eligible"] or include_watchlist]
+    selectable.sort(key=lambda r: (r["eligible"], r["factor_score"]), reverse=True)
+    results = selectable[:limit]
+    watchlist = [dict(row, rank=rank) for rank, row in enumerate(
+        (row for row in scored_candidates if not row["eligible"]), start=1
+    )][:limit]
+    rejection_counts = dict(Counter(reason for row in scored_candidates
+                                    for reason in row["eligibility_reasons"]))
+    eligible_count = sum(row["eligible"] for row in scored_candidates)
+    logger.info("Screened %d candidates: %d eligible, %d rejected; %d rows selected.",
+                len(scored_candidates), eligible_count,
+                len(scored_candidates) - eligible_count, len(results))
 
     # Assign ranks
     for rank, row in enumerate(results, start=1):
         row["rank"] = rank
 
+    if audit_dir is not None:
+        now = datetime.now(timezone.utc)
+        run_id = now.strftime("%Y%m%dT%H%M%S%fZ") + "_" + uuid4().hex
+        manifest = {
+            "run_id": run_id, "created_at": now.isoformat(), "as_of": screen_date.isoformat(),
+            "strategy": strat,
+            "implementation_sha256": _implementation_fingerprint(),
+            "config": {
+                "universe": universe, "sector": sector, "min_market_cap": min_market_cap,
+                "max_market_cap": max_market_cap, "max_pe": max_pe, "min_roe": min_roe,
+                "max_de": max_de, "min_dollar_volume": min_dollar_volume,
+                "max_ev_ebitda": max_ev_ebitda, "min_growth": min_growth,
+                "min_margin": min_margin, "min_pattern_score": min_pattern_score,
+                "limit": limit, "include_watchlist": include_watchlist,
+                "max_price_age_days": max_price_age_days, "weights": STRATEGY_PROFILES[strat],
+            },
+            "audit_scope": "Post-fundamental-filter candidate pool; SQL fundamental rejections are not recorded. Current fundamentals, not a historical backtest.",
+            "candidates": scored_candidates, "selected": results,
+            "watchlist": watchlist, "rejection_counts": rejection_counts,
+        }
+        directory = Path(audit_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        manifest_path = directory / f"{run_id}.json"
+        with manifest_path.open("x", encoding="utf-8") as handle:
+            json.dump(_json_safe(manifest), handle, indent=2, default=_json_default, allow_nan=False)
+        logger.info("Screening run record saved to: %s", manifest_path.resolve())
+
     # Display Rich Table
     if print_table:
-        _display_rich_screen_results(results, strategy=strat, universe=universe, sector=sector)
+        console.print(f"{len(raw_candidates)} passed fundamental filters; "
+                      f"{eligible_count} passed entry checks.")
+        if results:
+            _display_rich_screen_results(results, strategy=strat, universe=universe, sector=sector)
+        elif not raw_candidates:
+            console.print("No fundamental candidates. Check universe coverage and fundamental thresholds.")
+        elif limit == 0:
+            console.print("No rows requested (--top 0).")
+        else:
+            console.print("No eligible entries. Research watchlist below; all rows failed entry checks.")
+            table = Table(title="Research watchlist", box=box.SIMPLE_HEAD)
+            table.add_column("Ticker", no_wrap=True)
+            table.add_column("6M", justify="right", no_wrap=True)
+            table.add_column("Entry checks failed", overflow="fold")
+            for row in watchlist:
+                table.add_row(row["ticker"], _format_pct(row.get("price_return_6m")),
+                              "; ".join(reason.replace("_", " ") for reason in row["eligibility_reasons"]))
+            console.print(table)
+        if rejection_counts:
+            console.print("Failed checks (a stock can fail several): " + "; ".join(
+                f"{reason.replace('_', ' ')}: {count}"
+                for reason, count in sorted(rejection_counts.items(), key=lambda item: (-item[1], item[0]))
+            ))
 
     # Export to CSV
     if output_csv:
         _export_to_csv(results, output_csv)
+        output_path = Path(output_csv)
+        _export_to_csv(watchlist, output_path.with_name(output_path.stem + ".watchlist.csv"))
 
     return results
 
@@ -431,23 +602,22 @@ def _display_rich_screen_results(
     universe: str | None,
     sector: str | None,
 ) -> None:
-    """Render beautiful colored terminal table with technical pattern recognition badges."""
+    """Render a compact table with explicit entry status and complete price dates."""
     table = Table(
-        title=f"🚀 SCREENED EQUITIES • Strategy: [bold cyan]{strategy.upper()}[/] • Universe: [bold magenta]{universe or 'ALL'}[/]",
+        title=f"[bold cyan]{strategy.upper()}[/] | [bold magenta]{universe or 'ALL'}[/]",
         header_style="bold bright_white",
         show_lines=False,
+        box=box.SIMPLE_HEAD,
+        padding=(0, 0),
     )
 
-    table.add_column("Rank", justify="right", style="bold")
+    table.add_column("#", justify="right", style="bold")
     table.add_column("Ticker", justify="left", style="bold yellow")
-    table.add_column("Company", justify="left")
-    table.add_column("Sector", justify="left", style="magenta")
     table.add_column("Price", justify="right")
-    table.add_column("Market Cap", justify="right")
-    table.add_column("Rev Grw", justify="right")
-    table.add_column("52W High", justify="right")
-    table.add_column("RSI", justify="right")
-    table.add_column("Detected Technical Patterns", justify="left")
+    table.add_column("As of", justify="left", width=10, min_width=10, max_width=10, no_wrap=True)
+    table.add_column("Status", justify="left", no_wrap=True)
+    table.add_column("3M", justify="right")
+    table.add_column("3M-SPY", justify="right")
     table.add_column("Score", justify="right", style="bold")
 
     for r in results:
@@ -460,88 +630,33 @@ def _display_rich_screen_results(
         else:
             score_str = f"[white]{sc:.1f}[/]"
 
-        # Rank badge
-        rank_val = r["rank"]
-        if rank_val == 1:
-            rank_str = "[bold yellow]🥇 1[/]"
-        elif rank_val == 2:
-            rank_str = "[bold white]🥈 2[/]"
-        elif rank_val == 3:
-            rank_str = "[bold bronze]🥉 3[/]"
-        else:
-            rank_str = f"{rank_val}"
-
-        # Revenue growth color
-        rg = r.get("revenue_growth")
-        rg_str = f"[green]{_format_pct(rg)}[/]" if rg and rg > 0 else f"[red]{_format_pct(rg)}[/]"
-
-        # Distance from 52W high
-        d52 = r.get("dist_52w_high")
-        d52_str = f"{_format_pct(d52)}" if d52 is not None else "N/A"
-
-        # RSI color
-        rsi_val = r.get("rsi_14")
-        if rsi_val is not None:
-            if 50.0 <= rsi_val <= 70.0:
-                rsi_str = f"[green]{rsi_val:.1f}[/]"
-            elif rsi_val > 70.0:
-                rsi_str = f"[yellow]{rsi_val:.1f}[/]"
-            else:
-                rsi_str = f"[dim]{rsi_val:.1f}[/]"
-        else:
-            rsi_str = "N/A"
-
-        # Pattern badge formatting
-        pats = r.get("detected_patterns") or "Neutral"
-        styled_pats = []
-        for p in pats.split(","):
-            p_clean = p.strip()
-            if "Stage 2" in p_clean:
-                styled_pats.append("[bold green]Stage 2[/]")
-            elif "VCP" in p_clean:
-                styled_pats.append("[bold yellow]VCP Coiling[/]")
-            elif "Breakout" in p_clean:
-                styled_pats.append("[bold cyan]Breakout[/]")
-            elif "Accumulation" in p_clean:
-                styled_pats.append("[bold magenta]Accum[/]")
-            elif "Momentum" in p_clean:
-                styled_pats.append("[blue]Momentum[/]")
-            else:
-                styled_pats.append(f"[dim]{p_clean}[/]")
-        pat_display = " • ".join(styled_pats)
-
         table.add_row(
-            rank_str,
+            str(r["rank"]),
             r["ticker"],
-            (r["name"][:18] + "..") if len(r.get("name", "")) > 20 else r.get("name", ""),
-            (r["sector"][:13]) if r.get("sector") else "N/A",
             f"${float(r['current_price']):.2f}" if r.get("current_price") else "N/A",
-            _format_currency_compact(r.get("market_cap")),
-            rg_str,
-            d52_str,
-            rsi_str,
-            pat_display,
+            str(r.get("price_as_of") or "N/A")[:10],
+            r["setup_status"] if r["eligible"] else "Excluded",
+            _format_pct(r.get("price_return_3m")),
+            _format_pct(r.get("relative_return_3m")),
             score_str,
         )
 
     console.print()
     console.print(table)
-    console.print(
-        Panel(
-            "[bold white]Pattern Legend:[/] [green]Stage 2[/] (Minervini Trend Template) • "
-            "[yellow]VCP Coiling[/] (Volatility Contraction) • "
-            "[cyan]Breakout[/] (Volume Resistance Break) • [magenta]Accum[/] (Institutional Buying U/D Volume > 1.2x)",
-            border_style="dim",
-        )
-    )
     console.print()
 
 
 def _export_to_csv(results: list[dict[str, Any]], output_csv: str | Path) -> None:
     """Export ranked results to CSV with comprehensive factor and technical pattern metrics."""
     csv_path = Path(output_csv)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "rank",
+        "eligible",
+        "setup_status",
+        "eligibility_reasons",
+        "price_as_of",
+        "technical_valid",
         "ticker",
         "name",
         "sector",
@@ -572,6 +687,11 @@ def _export_to_csv(results: list[dict[str, Any]], output_csv: str | Path) -> Non
         "gross_margin",
         "revenue_growth",
         "price_return_6m",
+        "price_return_1m",
+        "price_return_3m",
+        "relative_return_1m",
+        "relative_return_3m",
+        "relative_return_6m",
         "free_cash_flow",
         "volume",
         "dollar_volume",
@@ -591,4 +711,3 @@ def _export_to_csv(results: list[dict[str, Any]], output_csv: str | Path) -> Non
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     run_screen(strategy="upcoming_breakouts", limit=10)
-

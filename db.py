@@ -10,9 +10,11 @@ from __future__ import annotations
 import atexit
 import logging
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Any, Generator, Sequence
+from zoneinfo import ZoneInfo
 
 import psycopg
 from psycopg.rows import dict_row
@@ -279,6 +281,19 @@ def upsert_fundamentals(records: list[dict[str, Any]], batch_size: int = 500) ->
             current_price,
             volume,
             price_return_6m,
+            price_as_of,
+            technical_valid,
+            is_stage_2,
+            stage_2_rules_passed,
+            is_vcp,
+            is_breakout,
+            price_return_1m,
+            price_return_3m,
+            relative_return_1m,
+            relative_return_3m,
+            relative_return_6m,
+            sma_50,
+            sma_200,
             pattern_score,
             detected_patterns,
             dist_52w_high,
@@ -307,6 +322,19 @@ def upsert_fundamentals(records: list[dict[str, Any]], batch_size: int = 500) ->
             %(current_price)s,
             %(volume)s,
             %(price_return_6m)s,
+            %(price_as_of)s,
+            %(technical_valid)s,
+            %(is_stage_2)s,
+            %(stage_2_rules_passed)s,
+            %(is_vcp)s,
+            %(is_breakout)s,
+            %(price_return_1m)s,
+            %(price_return_3m)s,
+            %(relative_return_1m)s,
+            %(relative_return_3m)s,
+            %(relative_return_6m)s,
+            %(sma_50)s,
+            %(sma_200)s,
             %(pattern_score)s,
             %(detected_patterns)s,
             %(dist_52w_high)s,
@@ -334,6 +362,19 @@ def upsert_fundamentals(records: list[dict[str, Any]], batch_size: int = 500) ->
             current_price = EXCLUDED.current_price,
             volume = EXCLUDED.volume,
             price_return_6m = EXCLUDED.price_return_6m,
+            price_as_of = EXCLUDED.price_as_of,
+            technical_valid = EXCLUDED.technical_valid,
+            is_stage_2 = EXCLUDED.is_stage_2,
+            stage_2_rules_passed = EXCLUDED.stage_2_rules_passed,
+            is_vcp = EXCLUDED.is_vcp,
+            is_breakout = EXCLUDED.is_breakout,
+            price_return_1m = EXCLUDED.price_return_1m,
+            price_return_3m = EXCLUDED.price_return_3m,
+            relative_return_1m = EXCLUDED.relative_return_1m,
+            relative_return_3m = EXCLUDED.relative_return_3m,
+            relative_return_6m = EXCLUDED.relative_return_6m,
+            sma_50 = EXCLUDED.sma_50,
+            sma_200 = EXCLUDED.sma_200,
             pattern_score = EXCLUDED.pattern_score,
             detected_patterns = EXCLUDED.detected_patterns,
             dist_52w_high = EXCLUDED.dist_52w_high,
@@ -370,7 +411,20 @@ def upsert_fundamentals(records: list[dict[str, Any]], batch_size: int = 500) ->
             "current_price": r.get("current_price"),
             "volume": r.get("volume"),
             "price_return_6m": r.get("price_return_6m"),
-            "pattern_score": r.get("pattern_score", 50.0),
+            "pattern_score": r.get("pattern_score"),
+            "price_as_of": r.get("price_as_of"),
+            "technical_valid": r.get("technical_valid"),
+            "is_stage_2": r.get("is_stage_2"),
+            "stage_2_rules_passed": r.get("stage_2_rules_passed"),
+            "is_vcp": r.get("is_vcp"),
+            "is_breakout": r.get("is_breakout"),
+            "price_return_1m": r.get("price_return_1m"),
+            "price_return_3m": r.get("price_return_3m"),
+            "relative_return_1m": r.get("relative_return_1m"),
+            "relative_return_3m": r.get("relative_return_3m"),
+            "relative_return_6m": r.get("relative_return_6m"),
+            "sma_50": r.get("sma_50"),
+            "sma_200": r.get("sma_200"),
             "detected_patterns": r.get("detected_patterns", "Neutral"),
             "dist_52w_high": r.get("dist_52w_high"),
             "rsi_14": r.get("rsi_14"),
@@ -393,7 +447,7 @@ def upsert_fundamentals(records: list[dict[str, Any]], batch_size: int = 500) ->
 def get_stale_tickers(
     tickers: Sequence[str] | None = None,
     universe: str | None = None,
-    max_age_days: int = 30,
+    max_age_days: int | None = None,
 ) -> list[str]:
     """
     Identify tickers requiring fundamental data fetching.
@@ -410,8 +464,12 @@ def get_stale_tickers(
     if tickers is not None and len(tickers) == 0:
         return []
 
+    max_age_days = max_age_days if max_age_days is not None else settings.DATA_MAX_AGE_DAYS
+    latest_session = datetime.now(ZoneInfo("America/New_York")).date() - timedelta(days=1)
+    while latest_session.weekday() >= 5:
+        latest_session -= timedelta(days=1)
     filters = ["c.is_active = TRUE"]
-    params: dict[str, Any] = {"max_age_days": max_age_days}
+    params: dict[str, Any] = {"max_age_days": max_age_days, "latest_session": latest_session}
 
     if universe:
         if universe.upper().strip() == "UPCOMING":
@@ -433,14 +491,18 @@ def get_stale_tickers(
         SELECT c.ticker
         FROM companies c
         LEFT JOIN (
-            SELECT ticker, MAX(updated_at) AS latest_update
+            SELECT DISTINCT ON (ticker) ticker, updated_at AS latest_update,
+                   price_as_of, technical_valid
             FROM fundamentals
-            GROUP BY ticker
+            ORDER BY ticker, fiscal_date DESC, updated_at DESC
         ) f ON c.ticker = f.ticker
         WHERE {where_clause}
           AND (
               f.latest_update IS NULL
               OR f.latest_update < NOW() - (%(max_age_days)s || ' days')::INTERVAL
+              OR f.price_as_of IS NULL
+              OR f.price_as_of < %(latest_session)s
+              OR f.technical_valid IS NOT TRUE
           )
         ORDER BY
             CASE
@@ -480,7 +542,7 @@ def query_screened_stocks(
     min_pattern_score: float | None = None,
     universe: str | None = None,
     sector: str | None = None,
-    limit: int = 50,
+    limit: int | None = None,
 ) -> list[dict[str, Any]]:
     """
     Retrieve candidate stocks with enriched fundamentals & technical pattern metrics.
@@ -518,6 +580,10 @@ def query_screened_stocks(
     if max_pe is not None:
         where_clauses.append("lf.pe_forward > 0 AND lf.pe_forward <= %(max_pe)s")
         params["max_pe"] = max_pe
+
+    if max_ev_ebitda is not None:
+        where_clauses.append("(c.sector IN ('Financials', 'Financial Services') OR (lf.ev_to_ebitda > 0 AND lf.ev_to_ebitda <= %(max_ev_ebitda)s))")
+        params["max_ev_ebitda"] = max_ev_ebitda
 
     if min_roe is not None:
         effective_min_roe = min_roe / 100.0 if min_roe > 1.0 else min_roe
@@ -584,6 +650,19 @@ def query_screened_stocks(
                 f.current_price,
                 f.volume,
                 f.price_return_6m,
+                f.price_as_of,
+                f.technical_valid,
+                f.is_stage_2,
+                f.stage_2_rules_passed,
+                f.is_vcp,
+                f.is_breakout,
+                f.price_return_1m,
+                f.price_return_3m,
+                f.relative_return_1m,
+                f.relative_return_3m,
+                f.relative_return_6m,
+                f.sma_50,
+                f.sma_200,
                 f.pattern_score,
                 f.detected_patterns,
                 f.dist_52w_high,
@@ -618,6 +697,20 @@ def query_screened_stocks(
             lf.volume,
             lf.dollar_volume,
             lf.price_return_6m,
+            lf.price_as_of,
+            lf.technical_valid,
+            lf.is_stage_2,
+            lf.stage_2_rules_passed,
+            lf.is_vcp,
+            lf.is_breakout,
+            lf.price_return_1m,
+            lf.price_return_3m,
+            lf.relative_return_1m,
+            lf.relative_return_3m,
+            lf.relative_return_6m,
+            lf.sma_50,
+            lf.sma_200,
+            lf.updated_at,
             lf.pattern_score,
             lf.detected_patterns,
             lf.dist_52w_high,
@@ -638,5 +731,3 @@ def query_screened_stocks(
 
     logger.info("Screening query candidate pool: %d equities retrieved.", len(rows))
     return list(rows)
-
-

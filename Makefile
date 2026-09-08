@@ -2,7 +2,7 @@
 # Stock Screener & Fundamental Analysis Pipeline - Docker Automation Makefile
 # ==============================================================================
 
-.PHONY: help build up down restart logs init-db sync-universe fetch screen run-all clean
+.PHONY: help build up down restart logs init-db sync-universe fetch screen run-all clean test
 
 # Default target
 help:
@@ -12,7 +12,7 @@ help:
 	@echo "  make down           - Stop all containers"
 	@echo "  make logs           - Stream container logs"
 	@echo "  make init-db        - Run schema migrations inside Docker"
-	@echo "  make sync-universe  - Discover US equities (default: S&P 500 with GICS sectors)"
+	@echo "  make sync-universe  - Discover the upcoming equity universe"
 	@echo "  make fetch          - Fetch fundamentals for stale tickers"
 	@echo "  make screen         - Execute institutional 4-pillar multi-factor screen"
 	@echo "  make run-all        - Execute full pipeline: init -> sync -> fetch -> screen"
@@ -37,19 +37,19 @@ init-db: up
 	docker compose run --rm app init-db
 
 sync-universe: up
-	docker compose run --rm app sync-universe --source sp500
+	docker compose run --rm app sync-universe --source upcoming
 
 fetch: up
-	docker compose run --rm app fetch --universe sp500 --workers 8 --limit 50
+	docker compose run --rm app fetch --universe upcoming --workers 8
 
 screen: up
-	docker compose run --rm app screen --strategy upcoming_breakouts --top 15
+	docker compose run --rm app screen --universe upcoming --strategy upcoming_breakouts --top 15
 
 upcoming: up
-	docker compose run --rm app screen --strategy upcoming_breakouts --top 15
+	docker compose run --rm app screen --universe upcoming --strategy upcoming_breakouts --top 15
 
 trend: up
-	docker compose run --rm app screen --strategy minervini_trend --top 15
+	docker compose run --rm app screen --universe upcoming --strategy minervini_trend --top 15
 
 run-all: up
 	docker compose run --rm app run-all --universe upcoming --strategy upcoming_breakouts --top 15
@@ -57,3 +57,5 @@ run-all: up
 clean:
 	docker compose down -v
 
+test:
+	python3 -m unittest discover -s tests -v

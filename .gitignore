@@ -13,6 +13,9 @@ ENV/
 
 # Output reports
 screened_results.csv
+screened_results.watchlist.csv
+runs/
+outcomes.csv
 
 # IDE & OS
 .DS_Store

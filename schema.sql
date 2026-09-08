@@ -56,6 +56,27 @@ ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS operating_margin NUMERIC;
 ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS gross_margin NUMERIC;
 ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS free_cash_flow BIGINT;
 ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS price_return_6m NUMERIC;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS price_as_of DATE;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS technical_valid BOOLEAN;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS is_stage_2 BOOLEAN;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS stage_2_rules_passed SMALLINT;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS is_vcp BOOLEAN;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS is_breakout BOOLEAN;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS price_return_1m NUMERIC;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS price_return_3m NUMERIC;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS relative_return_1m NUMERIC;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS relative_return_3m NUMERIC;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS relative_return_6m NUMERIC;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS sma_50 NUMERIC;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS sma_200 NUMERIC;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS pattern_score NUMERIC;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS detected_patterns TEXT;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS dist_52w_high NUMERIC;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS rsi_14 NUMERIC;
+ALTER TABLE fundamentals ADD COLUMN IF NOT EXISTS ud_volume_ratio NUMERIC;
+COMMENT ON COLUMN fundamentals.fiscal_date IS 'Snapshot observation date; legacy name, not a fiscal period';
+COMMENT ON COLUMN fundamentals.price_as_of IS 'Last completed source price session';
+COMMENT ON COLUMN fundamentals.updated_at IS 'Fundamentals and technical snapshot fetch timestamp';
 
 -- ============================================================================
 -- Indexes for Performance & Analytical Screening Queries
@@ -78,4 +99,3 @@ CREATE INDEX IF NOT EXISTS idx_companies_updated_at
 
 CREATE INDEX IF NOT EXISTS idx_fundamentals_updated_at 
     ON fundamentals (updated_at);
-

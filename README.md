@@ -1,146 +1,147 @@
-# Institutional Stock Screener & Fundamental Analysis Pipeline (Docker Edition)
+# Stock Screening and Outcome Tracking
 
-A production-ready quantitative equity screening and fundamental analysis pipeline in Python (3.11+) backed by PostgreSQL 16, fully containerized with Docker & Docker Compose.
+Python equity screening with PostgreSQL, Yahoo Finance fundamentals and adjusted
+daily prices, explicit technical eligibility, and recorded screening runs.
+Scores rank candidates; they are not probabilities of profit or validated return forecasts.
 
-The engine discovers benchmark US equities (**S&P 500**, **Nasdaq 100**, **Dow 30**, or sanitized **SEC EDGAR**), extracts granular fundamental and valuation metrics with client-side rate limiting and thread concurrency, persists data into PostgreSQL, and scores companies using an institutional **4-pillar multi-factor model** with curated investment strategy presets.
+## Daily Workflow
 
----
-
-## Architecture & Project Structure
-
-```text
-stock_screener/
-├── docker-compose.yml   # Multi-container orchestration (PostgreSQL 16 & App runner)
-├── Dockerfile           # Production Python 3.12 container definition
-├── Makefile             # Convenient command shortcuts for Docker workflows
-├── requirements.txt     # Production dependencies (psycopg, rich, yfinance, pydantic)
-├── .env.example         # Environment template with SEC fair-access User-Agent
-├── schema.sql           # Database DDL: companies, fundamentals, indexes & migrations
-├── config.py            # Type-safe configuration via Pydantic Settings
-├── db.py                # Connection pool, migrations, profile updates, SQL queries
-├── universe.py          # Benchmark universes (Upcoming Leaders, S&P 400 MidCap, S&P 500, Nasdaq 100, Dow 30, SEC)
-├── patterns.py          # Technical chart pattern recognition (Minervini Stage 2, VCP, Breakout, Accumulation)
-├── fetcher.py           # yfinance fundamentals extraction, 1Y OHLCV, 6M momentum & pattern analysis
-├── screener.py          # Multi-factor quantitative engine, strategy presets & rich CLI badges
-└── main.py              # Unified CLI entrypoint orchestrating pipeline subcommands
-```
-
----
-
-## Technical Pattern Recognition Engine
-
-In addition to fundamental pillars, the pipeline integrates quantitative price-action and institutional volume analysis ([patterns.py](patterns.py)) on 1-year daily OHLCV data:
-
-1. **Mark Minervini Stage 2 Trend Template (U.S. Investing Championship setup):**
-   * Current Price > 50-day SMA > 150-day SMA > 200-day SMA.
-   * 200-day moving average sloping upwards over the past 20 trading days.
-   * Within 22% of 52-week high and $\ge 20\%$ off 52-week low.
-2. **Volatility Contraction Pattern (VCP):**
-   * Coiling price ranges with diminishing amplitude near 52-week highs, indicating institutional supply absorption.
-3. **Consolidation Resistance Breakout:**
-   * Price eclipsing 20-to-50-day resistance on $\ge 1.20\times$ 50-day average trading volume.
-4. **Institutional Accumulation / Distribution (Up/Down Volume Ratio):**
-   * Ratio of volume on up-days vs. down-days over the past 20 sessions $\ge 1.20\times$, signaling institutional buying.
-5. **RSI(14) Momentum Sweet Spot:**
-   * 14-day Relative Strength Index between 50 and 72 (strong bullish momentum without being overextended).
-
----
-
-## Institutional Multi-Factor Quantitative Model
-
-Instead of simplistic unscaled linear additions that reward value traps and contracting companies, the engine groups financial metrics into **normalized pillars (0 to 100 scale)**:
-
-1. **Quality Pillar (Q):**
-   * Return on Equity (ROE $> 15\%$)
-   * Operating Margin & Net Profit Margin
-   * Balance Sheet Safety (Debt-to-Equity $< 100$)
-2. **Growth Pillar (G):**
-   * YoY Revenue Growth
-   * *Anti-Trap Guardrail:* Hard disqualifier / heavy penalty on contracting top-lines ($< 0\%$).
-3. **Valuation Pillar (V):**
-   * Forward P/E (curves 8x–22x highest; penalizes hyper-expensive multiples while avoiding distressed value traps)
-   * PEG Ratio (Peter Lynch metric: PEG $< 1.5$ rewarded)
-   * EV / EBITDA multiple (automatically adapted/neutralized for Financials)
-4. **Momentum & Cash Flow (M):**
-   * 6-Month Relative Price Momentum (prevents catching "falling knives")
-   * Free Cash Flow (FCF) generation
-5. **Technical Pattern Score (P):**
-   * 0 to 100 score synthesized from Stage 2 trends, VCP coiling, breakouts, and accumulation.
-
-### Curated Strategy Presets
-
-* `upcoming_breakouts` (Emerging High-Growth Leaders): 35% Pattern, 30% Growth, 20% Quality, 15% Valuation. Filters for $1B–$80B mid-caps with accelerating growth ($\ge 12\%$) and confirmed technical setups.
-* `minervini_trend` (Trend Template & VCP): 45% Pattern, 25% Growth, 15% Quality, 15% Valuation. Demands high pattern scores ($\ge 65.0$) and upward-trending moving averages.
-* `balanced` (Default): 30% Quality, 25% Growth, 25% Valuation, 20% Momentum.
-* `quality_compounders` (Buffett / Terry Smith style): 50% Quality, 20% Growth/FCF, 15% Valuation, 15% Momentum.
-* `garp` (Peter Lynch Growth At A Reasonable Price): 40% Growth, 30% Valuation/PEG, 20% Quality, 10% Momentum.
-* `deep_value`: 50% Valuation, 25% Quality, 15% Momentum, 10% Growth.
-* `high_growth_momentum`: 45% Growth, 35% Momentum, 15% Quality, 5% Valuation.
-
----
-
-## Running with Docker (Recommended)
-
-### 1. Configure Environment
 ```bash
 cp .env.example .env
-```
-
-### 2. Run with Docker Compose (Single Command)
-```bash
-# Build images and run end-to-end workflow (S&P 500 benchmark)
-docker compose up --build
-```
-
----
-
-## Step-by-Step Execution via Docker / Make
-
-```bash
-# Start PostgreSQL in background
-make up
-
-# 1. Apply schema DDL migrations
-make init-db
-
-# 2. Discover benchmark universe (S&P 500 with GICS Sector classifications)
-make sync-universe
-
-# 3. Fetch fundamental & valuation metrics for stale tickers concurrently
-make fetch
-
-# 4. Run quantitative multi-factor screen (Top 20 ranked equities)
-make screen
-
-# 5. Run end-to-end orchestrated workflow
+docker compose up -d db
+docker compose build app
 make run-all
 ```
 
-### Direct CLI Examples:
+`run-all` migrates the database, synchronizes the upcoming universe, refreshes the
+entire stale universe, screens it, and writes a CSV plus an immutable run JSON.
+`--limit` is an optional fetch cap; it no longer defaults to 50. A capped fetch
+does not restrict screening to the fetched tickers.
+
+Direct CLI with dependencies from `requirements.txt` installed:
+
 ```bash
-# Screen upcoming high-growth compounders with technical pattern setups
-python3 main.py screen --strategy upcoming_breakouts --top 15
-
-# Screen Minervini Stage 2 Trend Template & VCP setups
-python3 main.py screen --strategy minervini_trend --top 15
-
-# Screen traditional value/growth strategies
-python3 main.py screen --strategy quality_compounders --top 15
-python3 main.py screen --strategy garp --top 15
-
-# Screen by Economic Sector
-python3 main.py screen --sector Technology --top 10
-python3 main.py screen --sector Healthcare --top 10
-
-# End-to-end pipeline run (Upcoming universe)
-python3 main.py run-all --universe upcoming --strategy upcoming_breakouts --workers 8 --limit 50 --top 20
+python3 main.py run-all --universe upcoming --strategy upcoming_breakouts --max-age-days 0 --top 20
+python3 main.py screen --universe upcoming --strategy upcoming_breakouts --include-watchlist
+python3 main.py screen --universe upcoming --strategy minervini_trend
 ```
 
----
+Existing installations must run `init-db` (or `run-all`) and refresh data before
+screening: old snapshots lack the new validity flags and price dates and will be
+excluded. `--max-age-days 0` forces refresh. Normal cache age defaults to one day.
 
-## Outputs & Persistence
+## Data and Freshness
 
-1. **PostgreSQL Database:** Stored in persistent Docker volume (`pgdata`) or local Postgres instance.
-2. **Terminal Presentation:** Rich color-coded CLI table displaying Rank, Ticker, Company, Sector, Valuation, Quality, Growth, 6M Momentum, and Composite Pillar breakdown (`Q / G / V / M`).
-3. **CSV Report:** Exported to `./screened_results.csv` with full numerical metrics.
+- Prices use two years of adjusted OHLCV history. The current New York calendar
+  date is always excluded, including after market close. Run the next morning
+  to include the preceding session; same-evening runs deliberately lag one session.
+- `price_as_of` records the actual completed source session; `updated_at` records
+  snapshot fetch time. Missing final prices never inherit a fresh timestamp.
+- Prices and fundamentals still refresh together. Separate fetch cadences are a
+  future optimization; the old shared 30-day technical cache is no longer the default.
+- Screening rejects missing, future, or stale price dates. The default tolerance
+  is five calendar days to accommodate weekends/holidays; adjust with
+  `--max-price-age-days`. It is a calendar tolerance, not an exchange-calendar guarantee.
+- Stale selection uses the preceding weekday and retries invalid technical data;
+  exchange holidays and short-history stocks can therefore cause repeat fetches.
+- SPY is fetched once per batch. Relative returns are stock return minus SPY return
+  over matching 21/63/126-session endpoints. Missing or invalid aligned data yields
+  unavailable metrics, not neutral benchmark strength.
+- `fiscal_date` is a legacy name for the snapshot observation date, not a fiscal
+  period. `filing_date` currently contains Yahoo's most recent quarter date, not
+  a verified publication date. These snapshots cannot reconstruct past information availability.
 
+## Eligibility Before Ranking
+
+Fundamental filters select the candidate pool. The whole matching pool is scored;
+it is no longer truncated to the largest 200 companies before ranking. EV/EBITDA
+limits are enforced, with Financials/Financial Services exempted.
+
+For `upcoming_breakouts`, `minervini_trend`, and `high_growth_momentum`, eligibility
+requires valid technical history, confirmed Stage 2, positive three- and six-month
+returns, and positive three-month excess return over SPY. The one-month return must
+be available but can be flat or negative during consolidation.
+
+`upcoming_breakouts` additionally requires VCP or a confirmed breakout. Existing
+strategy weights remain unchanged; eligibility prevents strong fundamentals from
+compensating for a failed entry requirement. Thresholds are hypotheses for validation.
+
+| State | Meaning |
+| --- | --- |
+| Watchlist | No confirmed VCP/breakout, or entry requirements failed; inspect `eligible` and reasons |
+| Setup forming | Eligible Stage 2 stock with a qualifying contraction |
+| Confirmed breakout | Eligible Stage 2 stock closed above prior resistance with qualifying volume |
+
+By default failed candidates are excluded. `--include-watchlist` appends them after
+eligible candidates, within `--top`, and marks them excluded. Non-trend fundamental
+strategies and Stage 2-only candidates can be eligible while labeled Watchlist;
+eligibility and setup state describe different properties.
+
+Technical analysis requires 252 complete, finite, aligned OHLCV rows. Stage 2 uses
+full 50/150/200-session averages and an upward 200-session average. Breakout requires
+a close strictly above the prior 25-session high, with at least 1.2 times the prior
+50-session average volume (excluding the signal session). VCP requires an uptrend,
+contracting ranges and lower recent volume. Accumulation compares up/down volume
+within the same last 20 sessions. Missing technical scores remain unavailable;
+zero scores are preserved. Recently listed equities with insufficient history are excluded.
+
+Other strategies remain available: `balanced`, `quality_compounders`, `garp`, and
+`deep_value`. All strategies require usable, recent prices; trend-specific gates
+do not apply to these fundamental strategies.
+
+## Run Records and Outcomes
+
+Each screen creates `runs/<timestamp>_<uuid>.json` (change with `--audit-dir`),
+containing configuration, weights, original candidate inputs, rejection reasons,
+selected rows, a UTC creation timestamp, and a SHA256 fingerprint of the screening,
+fetching, pattern, and database source files. The audit covers the pool *after*
+fundamental SQL filters; it does not record stocks rejected by those filters.
+CSV includes setup state, eligibility, reasons, source date, and absolute/relative returns.
+An empty screen writes a header-only CSV, replacing any previous result rows.
+Every CSV export also writes a separate `<name>.watchlist.csv` with the top rejected
+candidates and their reasons (or just its header when none were rejected). When
+there are no eligible entries, the terminal shows this research watchlist and a
+summary of failed checks instead of an empty table. Watchlist rows remain ineligible;
+they are not silently added to the run's selected entries or evaluated as trades.
+`--include-watchlist` still explicitly includes these rows in the main output.
+
+Measure a saved run later:
+
+```bash
+python3 main.py evaluate --run runs/RUN_FILE.json --output-csv outcomes.csv --cost-bps 10
+```
+
+The evaluator measures 5/20/60-session outcomes from the first session open after
+the run's New York creation date. It uses adjusted prices, SPY-defined sessions,
+and completed daily closes. Outputs include gross and net return, benchmark net
+return, excess return, and maximum close-to-close drawdown including entry.
+It applies the configurable round-trip cost equally to the stock and benchmark;
+excess return therefore equals the gross return difference. Drawdown is gross,
+not intraday. Watchlist selections retain their `eligible` flag in the outcome CSV.
+
+Unelapsed horizons are pending; missing benchmark/stock data is explicitly marked
+unavailable. Delistings and missing data must be investigated rather than dropped
+from aggregate performance. This is forward observation tracking, not a portfolio
+simulator or a historical backtest. No automatic buys, sells, or scheduling are added.
+
+Before changing weights, compare saved versions on unseen periods with realistic
+costs and historical universe membership. A historical fundamental backtest needs
+point-in-time fundamentals and actual publication timestamps, which this data
+source and current snapshots do not supply.
+
+## Project and Verification
+
+`main.py` owns CLI orchestration; `universe.py` discovers tickers; `fetcher.py`
+retrieves snapshots; `patterns.py` computes signals; `db.py` and `schema.sql`
+persist/query them; `screener.py` handles eligibility/ranking/audits; `outcomes.py`
+measures subsequent observations. `config.py` loads environment settings.
+
+```bash
+make test
+```
+
+Tests use deterministic price fixtures and mocked providers/database calls. They
+cover flat/downward prices, true/false breakouts, missing history, volume windows,
+aligned benchmark returns, stale records, full-pool ranking, run records, CLI
+forwarding, and forward outcome timing. They establish calculation behavior, not
+investment performance.

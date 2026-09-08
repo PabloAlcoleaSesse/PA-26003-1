@@ -72,8 +72,9 @@ class Settings(BaseSettings):
 
     # Fundamental Data Cache Expiry
     DATA_MAX_AGE_DAYS: int = Field(
-        default=30,
-        description="Threshold in days before cached company fundamentals are considered stale.",
+        default=1,
+        ge=1,
+        description="Maximum cache age in days; prices are also checked against completed sessions.",
     )
 
     @property

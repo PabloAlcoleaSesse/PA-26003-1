@@ -11,10 +11,12 @@ from __future__ import annotations
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Sequence
 
 import yfinance as yf
+import pandas as pd
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -34,7 +36,7 @@ logger = logging.getLogger(__name__)
 def fetch_and_persist_stale(
     limit: int | None = None,
     max_workers: int | None = None,
-    max_age_days: int = 30,
+    max_age_days: int | None = None,
     tickers: Sequence[str] | None = None,
     universe: str | None = None,
     show_progress: bool = True,
@@ -73,6 +75,7 @@ def fetch_and_persist_stale(
         universe or "all",
     )
 
+    benchmark_history = _load_benchmark_history()
     records: list[dict[str, Any]] = []
     failures = 0
     delay = 1.0 / settings.RATE_LIMIT_PER_SEC if settings.RATE_LIMIT_PER_SEC > 0 else 0.0
@@ -80,7 +83,7 @@ def fetch_and_persist_stale(
     def worker(ticker: str) -> dict[str, Any] | None:
         if delay:
             time.sleep(delay)
-        return fetch_fundamentals(ticker)
+        return fetch_fundamentals(ticker, benchmark_history=benchmark_history)
 
     if show_progress:
         with Progress(
@@ -128,7 +131,7 @@ def fetch_and_persist_stale(
     return persisted
 
 
-def fetch_fundamentals(ticker: str) -> dict[str, Any] | None:
+def fetch_fundamentals(ticker: str, benchmark_history: pd.DataFrame | None = None) -> dict[str, Any] | None:
     """
     Fetch comprehensive fundamentals, balance sheet ratios, and 6M momentum from yfinance.
     Synchronizes company sector/industry profile into PostgreSQL.
@@ -162,36 +165,24 @@ def fetch_fundamentals(ticker: str) -> dict[str, Any] | None:
 
     # Historical price data for current price, volume, momentum, and technical pattern recognition
     try:
-        hist = stock.history(period="1y")
+        hist = _completed_history(stock.history(period="2y", auto_adjust=True))
     except Exception:
         hist = None
 
     current_price = _safe_number(
-        info.get("currentPrice")
-        or info.get("regularMarketPrice")
-        or (hist["Close"].dropna().iloc[-1] if hist is not None and not hist.empty and "Close" in hist else None)
+        hist["Close"].iloc[-1] if hist is not None and not hist.empty and "Close" in hist else None
     )
     volume = _safe_int(
-        info.get("averageVolume")
-        or info.get("averageVolume10days")
-        or (hist["Volume"].dropna().tail(30).mean() if hist is not None and not hist.empty and "Volume" in hist else None)
+        hist["Volume"].dropna().tail(30).mean() if hist is not None and not hist.empty and "Volume" in hist else None
     )
-
-    # 6-Month Relative Price Momentum
-    price_return_6m = None
-    if hist is not None and not hist.empty and len(hist) >= 15 and "Close" in hist:
-        close_series = hist["Close"].dropna()
-        if len(close_series) >= 2:
-            lookback_idx = min(126, len(close_series) - 1)
-            p_start = close_series.iloc[-lookback_idx]
-            p_end = close_series.iloc[-1]
-            if p_start and p_start > 0:
-                price_return_6m = _safe_number((p_end - p_start) / p_start)
 
     # Technical Pattern Recognition
     tech_patterns = patterns.analyze_technical_patterns(hist)
+    if benchmark_history is None:
+        benchmark_history = _load_benchmark_history()
 
-    fiscal_date = date.today()
+    # Legacy key names the observation date, not the company's fiscal period.
+    fiscal_date = datetime.now(ZoneInfo("America/New_York")).date()
     filing_date = _parse_date(info.get("mostRecentQuarter"))
 
     return {
@@ -214,14 +205,57 @@ def fetch_fundamentals(ticker: str) -> dict[str, Any] | None:
         "free_cash_flow": _safe_int(info.get("freeCashflow")),
         "current_price": current_price,
         "volume": volume,
-        "price_return_6m": price_return_6m,
-        "pattern_score": tech_patterns["pattern_score"],
-        "detected_patterns": tech_patterns["detected_patterns"],
-        "dist_52w_high": tech_patterns["dist_52w_high"],
-        "rsi_14": tech_patterns["rsi_14"],
-        "ud_volume_ratio": tech_patterns["ud_volume_ratio"],
+        "price_as_of": hist.index[-1].date() if current_price is not None and current_price > 0 else None,
+        **tech_patterns,
+        **_relative_returns(hist, benchmark_history),
         "raw_payload": info,
     }
+
+
+def _completed_history(hist: pd.DataFrame, today: date | None = None) -> pd.DataFrame:
+    """Conservatively omit today's candle, even when called after the close."""
+    today = today or datetime.now(ZoneInfo("America/New_York")).date()
+    result = hist.copy()
+    index = pd.DatetimeIndex(result.index)
+    if index.tz is not None:
+        index = index.tz_convert("America/New_York")
+    result.index = pd.to_datetime(index.date)
+    result = result.loc[result.index.date < today].sort_index()
+    return result.loc[~result.index.duplicated(keep="last")]
+
+
+def _load_benchmark_history() -> pd.DataFrame:
+    try:
+        return _completed_history(yf.Ticker("SPY").history(period="2y", auto_adjust=True))
+    except Exception as exc:
+        logger.warning("Benchmark price history unavailable: %s", exc)
+        return pd.DataFrame()
+
+
+def _relative_returns(hist: pd.DataFrame | None, benchmark: pd.DataFrame | None) -> dict[str, float | None]:
+    result = {f"relative_return_{period}": None for period in ("1m", "3m", "6m")}
+    if hist is None or benchmark is None or "Close" not in hist or "Close" not in benchmark:
+        return result
+    closes = hist["Close"]
+    benchmark_closes = _completed_history(benchmark)["Close"]
+    for period, sessions in (("1m", 21), ("3m", 63), ("6m", 126)):
+        if len(closes) <= sessions:
+            continue
+        start, end = closes.index[-sessions - 1], closes.index[-1]
+        if start not in benchmark_closes.index or end not in benchmark_closes.index:
+            continue
+        # Missing candles must not silently shorten or shift the return window.
+        window = closes.iloc[-sessions - 1:]
+        if not benchmark_closes.loc[start:end].index.equals(window.index):
+            continue
+        aligned_benchmark = benchmark_closes.reindex(window.index)
+        if any(_safe_number(value) is None or float(value) <= 0 for value in window) or any(_safe_number(value) is None or float(value) <= 0 for value in aligned_benchmark):
+            continue
+        first, last = _safe_number(benchmark_closes.loc[start]), _safe_number(benchmark_closes.loc[end])
+        stock_first, stock_last = _safe_number(closes.loc[start]), _safe_number(closes.loc[end])
+        if first is not None and first > 0 and last is not None and last > 0 and stock_first is not None and stock_first > 0 and stock_last is not None and stock_last > 0:
+            result[f"relative_return_{period}"] = stock_last / stock_first - last / first
+    return result
 
 
 def _safe_number(value: Any) -> float | None:
@@ -248,4 +282,3 @@ def _parse_date(value: Any) -> date | None:
         return date.fromtimestamp(int(value))
     except (TypeError, ValueError, OSError):
         return None
-

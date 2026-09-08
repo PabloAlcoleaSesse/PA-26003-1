@@ -20,6 +20,7 @@ import db
 import fetcher
 import screener
 import universe
+import outcomes
 from config import settings
 
 logger = logging.getLogger("stock_screener")
@@ -135,6 +136,9 @@ def cmd_screen(args: argparse.Namespace) -> int:
             limit=args.top,
             output_csv=args.output_csv,
             print_table=True,
+            include_watchlist=args.include_watchlist,
+            max_price_age_days=args.max_price_age_days,
+            audit_dir=args.audit_dir,
         )
         return 0
     except Exception as exc:
@@ -177,7 +181,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
         fetcher.fetch_and_persist_stale(
             limit=limit,
             max_workers=workers,
-            max_age_days=settings.DATA_MAX_AGE_DAYS,
+            max_age_days=args.max_age_days,
             universe=uni,
             show_progress=True,
         )
@@ -196,12 +200,23 @@ def cmd_run_all(args: argparse.Namespace) -> int:
             limit=args.top,
             output_csv=args.output_csv,
             print_table=True,
+            include_watchlist=args.include_watchlist,
+            max_price_age_days=args.max_price_age_days,
+            audit_dir=args.audit_dir,
         )
     except Exception as exc:
         logger.error("Screen execution failed: %s", exc)
         return 1
 
     print("[✓] Pipeline execution finished successfully.")
+    return 0
+
+
+def cmd_evaluate(args: argparse.Namespace) -> int:
+    """Measure saved selections only after their screening date."""
+    rows = outcomes.evaluate_run(args.run, args.output_csv, cost_bps=args.cost_bps)
+    complete = sum(row["status"] == "complete" for row in rows)
+    print(f"Outcome report: {complete}/{len(rows)} completed observations -> {args.output_csv}")
     return 0
 
 
@@ -429,8 +444,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_all.add_argument(
         "--limit",
         type=int,
-        default=50,
-        help="Number of stale tickers to fetch during run-all (default: 50).",
+        default=None,
+        help="Optional cap on stale tickers to fetch; default refreshes the full universe.",
     )
     p_all.add_argument(
         "--top",
@@ -451,6 +466,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path for exported CSV report (default: screened_results.csv).",
     )
     p_all.set_defaults(func=cmd_run_all)
+
+    p_all.add_argument("--max-age-days", type=int, default=settings.DATA_MAX_AGE_DAYS,
+                       help="Fetch cache age in calendar days (0 forces refresh).")
+    for screen_parser in (p_screen, p_all):
+        screen_parser.add_argument("--include-watchlist", action="store_true",
+                                   help="Include rejected entry candidates with reasons for research.")
+        screen_parser.add_argument("--max-price-age-days", type=int, default=5,
+                                   help="Maximum completed price-bar age in calendar days (default: 5).")
+        screen_parser.add_argument("--audit-dir", default="runs",
+                                   help="Directory for immutable screening run records.")
+
+    p_evaluate = subparsers.add_parser("evaluate", help="Measure 5/20/60-session outcomes of a saved run.")
+    p_evaluate.add_argument("--run", required=True, help="Screening run JSON path.")
+    p_evaluate.add_argument("--output-csv", default="outcomes.csv")
+    p_evaluate.add_argument("--cost-bps", type=float, default=10.0,
+                            help="Assumed round-trip cost in basis points, applied to stock and SPY.")
+    p_evaluate.set_defaults(func=cmd_evaluate)
 
     return parser
 
@@ -479,4 +511,3 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-
