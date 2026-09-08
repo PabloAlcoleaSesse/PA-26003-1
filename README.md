@@ -144,3 +144,20 @@ python3 main.py run-all --universe upcoming --strategy upcoming_breakouts --work
 2. **Terminal Presentation:** Rich color-coded CLI table displaying Rank, Ticker, Company, Sector, Valuation, Quality, Growth, 6M Momentum, and Composite Pillar breakdown (`Q / G / V / M`).
 3. **CSV Report:** Exported to `./screened_results.csv` with full numerical metrics.
 
+## Governance
+
+This project includes the following public-project governance documents:
+
+- [License (MIT)](LICENSE)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Contributing Guide](CONTRIBUTING.md)
+- [Security Policy](SECURITY.md)
+
+Community templates are available under [`.github/`](.github/) for issues and pull requests.
+
+---
+
+## Disclaimer
+
+This software is for educational and research purposes only and does not
+constitute financial advice.
