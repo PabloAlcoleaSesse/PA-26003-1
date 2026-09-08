@@ -34,7 +34,7 @@ services:
       - SEC_USER_AGENT=${SEC_USER_AGENT:-StockScreener admin@example.com}
     volumes:
       - .:/app
-    command: ["run-all", "--limit", "50"]
+    command: ["run-all", "--universe", "upcoming", "--strategy", "upcoming_breakouts", "--top", "15"]
 
 volumes:
   pgdata:

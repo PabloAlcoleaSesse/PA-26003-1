@@ -395,16 +395,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_all.add_argument(
         "--universe",
         type=str,
-        choices=["sp500", "nasdaq100", "dow30", "sec", "all"],
-        default="sp500",
-        help="Target equity universe (default: sp500).",
+        choices=["upcoming", "sp400", "sp500", "nasdaq100", "dow30", "sec", "all"],
+        default="upcoming",
+        help="Target equity universe (default: upcoming).",
     )
     p_all.add_argument(
         "--strategy",
         type=str,
-        choices=["balanced", "quality_compounders", "garp", "deep_value", "high_growth_momentum"],
-        default="balanced",
-        help="Quantitative investment strategy preset (default: balanced).",
+        choices=[
+            "upcoming_breakouts",
+            "minervini_trend",
+            "balanced",
+            "quality_compounders",
+            "garp",
+            "deep_value",
+            "high_growth_momentum",
+        ],
+        default="upcoming_breakouts",
+        help="Quantitative investment strategy preset (default: upcoming_breakouts).",
     )
     p_all.add_argument(
         "--sector",
@@ -429,6 +437,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=20,
         help="Number of top-ranked stocks to output (default: 20).",
+    )
+    p_all.add_argument(
+        "--max-market-cap",
+        type=int,
+        default=None,
+        help="Optional maximum Market Cap ceiling in USD (default: None, or strategy preset).",
     )
     p_all.add_argument(
         "--output-csv",

@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 COPY . . 
 
-CMD ["python", "fetcher.py"]
+ENTRYPOINT ["python", "main.py"]
+CMD ["run-all", "--universe", "upcoming", "--strategy", "upcoming_breakouts", "--top", "15"]
 
 

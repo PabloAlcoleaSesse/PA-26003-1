@@ -43,10 +43,16 @@ fetch: up
 	docker compose run --rm app fetch --universe sp500 --workers 8 --limit 50
 
 screen: up
-	docker compose run --rm app screen --strategy balanced --top 20
+	docker compose run --rm app screen --strategy upcoming_breakouts --top 15
+
+upcoming: up
+	docker compose run --rm app screen --strategy upcoming_breakouts --top 15
+
+trend: up
+	docker compose run --rm app screen --strategy minervini_trend --top 15
 
 run-all: up
-	docker compose run --rm app run-all --universe sp500 --strategy balanced --workers 8 --limit 50 --top 20
+	docker compose run --rm app run-all --universe upcoming --strategy upcoming_breakouts --top 15
 
 clean:
 	docker compose down -v
